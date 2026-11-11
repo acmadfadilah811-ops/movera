@@ -1,0 +1,32 @@
+# Flutter / Dart
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+.idea/
+android/local.properties
+**/android/local.properties
+**/android/.gradle/
+# Firebase config per environment, keep out of git
+**/google-services.json
+**/GoogleService-Info.plist
+# Secrets
+.env
+*.keystore
+*.jks
+key.properties
+# Generated per machine by flutter pub get
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Runner/GeneratedPluginRegistrant.*
+**/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+**/windows/flutter/generated_*
+**/windows/flutter/ephemeral/
+dist/
+
+# Dump crash JVM/Gradle
+*.hprof
+hs_err_pid*.log
+replay_pid*.log

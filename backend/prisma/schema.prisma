@@ -1,0 +1,568 @@
+// Skema database Movera. Mengikuti blueprint bagian 9.
+// Semua waktu disimpan timestamptz (UTC). Tanggal operasional (kuota, masa aktif) memakai @db.Date
+// dan dihitung dalam zona Asia/Jakarta di lapisan aplikasi.
+// Uang disimpan dalam rupiah bulat (Int), tanpa desimal.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Identity ----------
+
+enum Role {
+  SUPER_ADMIN
+  OPERATIONS_ADMIN
+  FLEET_ADMIN
+  FINANCE_ADMIN
+  CUSTOMER_SUPPORT
+  CUSTOMER
+  DRIVER
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  email        String     @unique
+  phone        String?    @unique
+  passwordHash String
+  fullName     String
+  /// Satu orang boleh merangkap beberapa peran admin (blueprint 13.1).
+  roles        Role[]
+  status       UserStatus @default(ACTIVE)
+  createdAt    DateTime   @default(now()) @db.Timestamptz
+  updatedAt    DateTime   @updatedAt @db.Timestamptz
+
+  refreshTokens      RefreshToken[]
+  addresses          CustomerAddress[]
+  passengers         Passenger[]
+  subscriptions      Subscription[]
+  payments           Payment[]
+  bookings           Booking[]
+  recurringSchedules RecurringSchedule[]
+  driver             Driver?
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  /// SHA-256 dari token; token asli tidak pernah disimpan.
+  tokenHash String    @unique
+  expiresAt DateTime  @db.Timestamptz
+  revokedAt DateTime? @db.Timestamptz
+  createdAt DateTime  @default(now()) @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------- Customer ----------
+
+model CustomerAddress {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  label     String
+  address   String
+  latitude  Float
+  longitude Float
+  createdAt DateTime @default(now()) @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, label])
+  @@map("customer_addresses")
+}
+
+/// Penumpang terdaftar milik pelanggan, misalnya anak (blueprint: customer_dependents + authorized_contacts).
+model Passenger {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @db.Uuid
+  name           String
+  relation       String
+  isChild        Boolean   @default(false)
+  school         String    @default("")
+  notes          String    @default("")
+  emergencyName  String    @default("")
+  emergencyPhone String    @default("")
+  createdAt      DateTime  @default(now()) @db.Timestamptz
+  deletedAt      DateTime? @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("passengers")
+}
+
+// ---------- Subscription & quota ----------
+
+model SubscriptionPlan {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  description  String   @default("")
+  price        Int
+  durationDays Int
+  dailyQuota   Int
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  updatedAt    DateTime @updatedAt @db.Timestamptz
+
+  subscriptions Subscription[]
+  payments      Payment[]
+
+  @@map("subscription_plans")
+}
+
+enum SubscriptionStatus {
+  PENDING_PAYMENT
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+model Subscription {
+  id         String             @id @default(uuid()) @db.Uuid
+  userId     String             @db.Uuid
+  planId     String             @db.Uuid
+  /// Harga dan kuota disalin saat pembelian; perubahan paket oleh admin tidak mengubah langganan berjalan.
+  price      Int
+  dailyQuota Int
+  startDate  DateTime           @db.Date
+  endDate    DateTime           @db.Date
+  status     SubscriptionStatus @default(PENDING_PAYMENT)
+  paymentId  String?            @unique @db.Uuid
+  createdAt  DateTime           @default(now()) @db.Timestamptz
+
+  user     User          @relation(fields: [userId], references: [id])
+  plan     SubscriptionPlan @relation(fields: [planId], references: [id])
+  payment  Payment?      @relation(fields: [paymentId], references: [id])
+  quotas   DailyQuota[]
+  bookings Booking[]
+
+  @@index([userId, status])
+  @@map("subscriptions")
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+  REFUNDED
+}
+
+model Payment {
+  id          String        @id @default(uuid()) @db.Uuid
+  userId      String        @db.Uuid
+  planId      String        @db.Uuid
+  amount      Int
+  status      PaymentStatus @default(PENDING)
+  provider    String
+  /// Order id yang dikirim ke payment gateway.
+  providerRef String        @unique
+  paidAt      DateTime?     @db.Timestamptz
+  createdAt   DateTime      @default(now()) @db.Timestamptz
+
+  user         User             @relation(fields: [userId], references: [id])
+  plan         SubscriptionPlan @relation(fields: [planId], references: [id])
+  subscription Subscription?
+
+  @@index([userId])
+  @@map("payments")
+}
+
+/// Webhook payment gateway. eventKey unik supaya webhook ganda diabaikan (idempotent).
+model WebhookEvent {
+  id          String    @id @default(uuid()) @db.Uuid
+  provider    String
+  eventKey    String    @unique
+  payload     Json
+  receivedAt  DateTime  @default(now()) @db.Timestamptz
+  processedAt DateTime? @db.Timestamptz
+  error       String?
+
+  @@map("webhook_events")
+}
+
+/// remaining = total - reserved - consumed. CHECK constraint di migrasi menjaga 0 <= reserved + consumed <= total.
+model DailyQuota {
+  id             String   @id @default(uuid()) @db.Uuid
+  subscriptionId String   @db.Uuid
+  quotaDate      DateTime @db.Date
+  total          Int
+  reserved       Int      @default(0)
+  consumed       Int      @default(0)
+
+  subscription Subscription       @relation(fields: [subscriptionId], references: [id])
+  transactions QuotaTransaction[]
+  bookings     Booking[]
+
+  @@unique([subscriptionId, quotaDate])
+  @@map("daily_quotas")
+}
+
+enum QuotaAction {
+  RESERVE
+  RELEASE
+  CONSUME
+  FORFEIT
+}
+
+model QuotaTransaction {
+  id           String      @id @default(uuid()) @db.Uuid
+  dailyQuotaId String      @db.Uuid
+  bookingId    String?     @db.Uuid
+  action       QuotaAction
+  quantity     Int         @default(1)
+  actorId      String?     @db.Uuid
+  createdAt    DateTime    @default(now()) @db.Timestamptz
+
+  dailyQuota DailyQuota @relation(fields: [dailyQuotaId], references: [id])
+
+  @@index([dailyQuotaId])
+  @@index([bookingId])
+  @@map("quota_transactions")
+}
+
+// ---------- Booking ----------
+
+enum BookingType {
+  FLEXIBLE
+  ROUTINE
+}
+
+enum RideMode {
+  INDIVIDUAL
+  SHARED
+}
+
+enum BookingStatus {
+  PENDING_DISPATCH
+  ASSIGNED
+  ON_THE_WAY
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum QuotaOutcome {
+  RELEASED
+  FORFEITED
+}
+
+/// MVP: satu titik jemput dan satu tujuan per booking. Rangkaian tujuan (booking_stops) menyusul.
+model Booking {
+  id                  String        @id @default(uuid()) @db.Uuid
+  userId              String        @db.Uuid
+  subscriptionId      String        @db.Uuid
+  dailyQuotaId        String        @db.Uuid
+  type                BookingType
+  rideMode            RideMode
+  scheduledAt         DateTime      @db.Timestamptz
+  pickupLabel         String        @default("")
+  pickupAddress       String
+  pickupLat           Float
+  pickupLng           Float
+  destinationLabel    String        @default("")
+  destinationAddress  String
+  destinationLat      Float
+  destinationLng      Float
+  passengerCount      Int
+  passengerNames      String[]
+  maxDetourMinutes    Int           @default(0)
+  note                String        @default("")
+  status              BookingStatus @default(PENDING_DISPATCH)
+  /// PIN 4 digit yang disebutkan penumpang ke driver.
+  pickupPin           String
+  recurringScheduleId String?       @db.Uuid
+  tripId              String?       @db.Uuid
+  cancelReason        String?
+  cancelledAt         DateTime?     @db.Timestamptz
+  cancelledById       String?       @db.Uuid
+  quotaOutcome        QuotaOutcome?
+  createdAt           DateTime      @default(now()) @db.Timestamptz
+  updatedAt           DateTime      @updatedAt @db.Timestamptz
+
+  user              User               @relation(fields: [userId], references: [id])
+  subscription      Subscription       @relation(fields: [subscriptionId], references: [id])
+  dailyQuota        DailyQuota         @relation(fields: [dailyQuotaId], references: [id])
+  recurringSchedule RecurringSchedule? @relation(fields: [recurringScheduleId], references: [id])
+  trip              Trip?              @relation(fields: [tripId], references: [id])
+  stops             TripStop[]
+
+  @@index([userId, scheduledAt])
+  @@index([status, scheduledAt])
+  /// Satu jadwal rutin hanya membuat satu booking per waktu jemput.
+  @@unique([recurringScheduleId, scheduledAt])
+  @@map("bookings")
+}
+
+model RecurringSchedule {
+  id                 String   @id @default(uuid()) @db.Uuid
+  userId             String   @db.Uuid
+  /// 1 = Senin ... 7 = Minggu
+  weekdays           Int[]
+  hour               Int
+  minute             Int
+  pickupLabel        String   @default("")
+  pickupAddress      String
+  pickupLat          Float
+  pickupLng          Float
+  destinationLabel   String   @default("")
+  destinationAddress String
+  destinationLat     Float
+  destinationLng     Float
+  rideMode           RideMode
+  passengerCount     Int
+  passengerNames     String[]
+  maxDetourMinutes   Int      @default(0)
+  note               String   @default("")
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now()) @db.Timestamptz
+
+  user     User      @relation(fields: [userId], references: [id])
+  bookings Booking[]
+
+  @@index([isActive])
+  @@map("recurring_schedules")
+}
+
+// ---------- Fleet & workforce ----------
+
+enum VehicleStatus {
+  ACTIVE
+  MAINTENANCE
+  INACTIVE
+}
+
+model Vehicle {
+  id             String        @id @default(uuid()) @db.Uuid
+  plateNumber    String        @unique
+  model          String
+  seats          Int
+  /// Jarak tempuh saat baterai penuh (km).
+  fullRangeKm    Int
+  status         VehicleStatus @default(ACTIVE)
+  batteryPercent Int           @default(100)
+  odometer       Int           @default(0)
+  createdAt      DateTime      @default(now()) @db.Timestamptz
+  updatedAt      DateTime      @updatedAt @db.Timestamptz
+
+  shifts DriverShift[]
+  trips  Trip[]
+
+  @@map("vehicles")
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Driver {
+  id               String           @id @default(uuid()) @db.Uuid
+  userId           String           @unique @db.Uuid
+  employeeCode     String           @unique
+  licenseNumber    String
+  licenseExpiry    DateTime         @db.Date
+  employmentStatus EmploymentStatus @default(ACTIVE)
+  createdAt        DateTime         @default(now()) @db.Timestamptz
+
+  user      User             @relation(fields: [userId], references: [id])
+  shifts    DriverShift[]
+  trips     Trip[]
+  incidents Incident[]
+  locations DriverLocation[]
+
+  @@map("drivers")
+}
+
+enum ShiftStatus {
+  SCHEDULED
+  AVAILABLE
+  ON_BREAK
+  CHARGING
+  ENDED
+}
+
+model DriverShift {
+  id             String      @id @default(uuid()) @db.Uuid
+  driverId       String      @db.Uuid
+  vehicleId      String      @db.Uuid
+  shiftDate      DateTime    @db.Date
+  status         ShiftStatus @default(SCHEDULED)
+  startedAt      DateTime?   @db.Timestamptz
+  endedAt        DateTime?   @db.Timestamptz
+  startBattery   Int?
+  endBattery     Int?
+  startOdometer  Int?
+  endOdometer    Int?
+  checklist      Json?
+  endNote        String      @default("")
+  createdAt      DateTime    @default(now()) @db.Timestamptz
+
+  driver  Driver  @relation(fields: [driverId], references: [id])
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id])
+  trips   Trip[]
+
+  @@unique([driverId, shiftDate])
+  @@map("driver_shifts")
+}
+
+// ---------- Dispatch & trips ----------
+
+enum TripStatus {
+  ASSIGNED
+  ACCEPTED
+  IN_PROGRESS
+  COMPLETED
+  REJECTED
+  CANCELLED
+}
+
+model Trip {
+  id           String     @id @default(uuid()) @db.Uuid
+  driverId     String     @db.Uuid
+  vehicleId    String     @db.Uuid
+  shiftId      String?    @db.Uuid
+  scheduledAt  DateTime   @db.Timestamptz
+  shared       Boolean    @default(false)
+  status       TripStatus @default(ASSIGNED)
+  estimatedKm  Float      @default(0)
+  rejectReason String?
+  assignedById String?    @db.Uuid
+  startedAt    DateTime?  @db.Timestamptz
+  completedAt  DateTime?  @db.Timestamptz
+  createdAt    DateTime   @default(now()) @db.Timestamptz
+
+  driver    Driver       @relation(fields: [driverId], references: [id])
+  vehicle   Vehicle      @relation(fields: [vehicleId], references: [id])
+  shift     DriverShift? @relation(fields: [shiftId], references: [id])
+  bookings  Booking[]
+  stops     TripStop[]
+  incidents Incident[]
+
+  @@index([driverId, scheduledAt])
+  @@map("trips")
+}
+
+enum StopType {
+  PICKUP
+  DROPOFF
+}
+
+enum StopStatus {
+  PENDING
+  ARRIVED
+  DONE
+  NO_SHOW
+  SKIPPED
+}
+
+model TripStop {
+  id        String     @id @default(uuid()) @db.Uuid
+  tripId    String     @db.Uuid
+  bookingId String     @db.Uuid
+  sequence  Int
+  type      StopType
+  status    StopStatus @default(PENDING)
+  arrivedAt DateTime?  @db.Timestamptz
+  doneAt    DateTime?  @db.Timestamptz
+
+  trip    Trip    @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  booking Booking @relation(fields: [bookingId], references: [id])
+
+  @@unique([tripId, sequence])
+  @@map("trip_stops")
+}
+
+enum IncidentType {
+  VEHICLE_DAMAGE
+  ACCIDENT
+  PASSENGER_ISSUE
+  CHILD_NO_RECEIVER
+  DELAY
+  OTHER
+}
+
+model Incident {
+  id          String       @id @default(uuid()) @db.Uuid
+  driverId    String       @db.Uuid
+  tripId      String?      @db.Uuid
+  type        IncidentType
+  description String
+  emergency   Boolean      @default(false)
+  resolvedAt  DateTime?    @db.Timestamptz
+  createdAt   DateTime     @default(now()) @db.Timestamptz
+
+  driver Driver @relation(fields: [driverId], references: [id])
+  trip   Trip?  @relation(fields: [tripId], references: [id])
+
+  @@index([createdAt])
+  @@map("incidents")
+}
+
+model DriverLocation {
+  id         BigInt   @id @default(autoincrement())
+  driverId   String   @db.Uuid
+  tripId     String?  @db.Uuid
+  latitude   Float
+  longitude  Float
+  accuracy   Float?
+  recordedAt DateTime @db.Timestamptz
+
+  driver Driver @relation(fields: [driverId], references: [id])
+
+  @@index([driverId, recordedAt])
+  @@map("driver_locations")
+}
+
+// ---------- Operations ----------
+
+/// Batas wilayah layanan. Kolom geometri PostGIS ditambahkan setelah ekstensi PostGIS terpasang.
+model ServiceZone {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  /// Sementara: GeoJSON Polygon.
+  boundary  Json?
+  createdAt DateTime @default(now()) @db.Timestamptz
+
+  @@map("service_zones")
+}
+
+/// Kebijakan yang bisa diubah admin, contoh: batas pembatalan, minimal waktu booking.
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt @db.Timestamptz
+  updatedBy String?  @db.Uuid
+
+  @@map("system_settings")
+}
+
+model AuditLog {
+  id        BigInt   @id @default(autoincrement())
+  actorId   String?  @db.Uuid
+  action    String
+  entity    String
+  entityId  String?
+  data      Json?
+  createdAt DateTime @default(now()) @db.Timestamptz
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
